@@ -1,0 +1,9 @@
+venv/
+data/
+models/*.pt
+__pycache__/
+*.pyc
+*.png
+.claude/
+CLAUDE.md
+.claudeignore
