@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from transformers import RobertaTokenizer
+from transformers import RobertaTokenizer, CLIPProcessor
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
@@ -157,16 +157,20 @@ class BiasDataset(Dataset):
     """
     Custom PyTorch Dataset for the multimodal bias data.
 
-    I didn't know about Dataset/DataLoader before this project. You have
-    to implement __len__ (how many samples?) and __getitem__ (give me
-    sample #idx). Once you do that, DataLoader handles batching, shuffling,
-    and parallel loading automatically -- it's pretty cool.
-
     Each sample gives back:
         input_ids, attention_mask  -- tokenized text for RoBERTa
-        image                      -- preprocessed image tensor
+        image                      -- preprocessed image tensor (or zeros if using desc fallback)
+        pixel_values               -- same as image (alias for fusion model compatibility)
+        clip_text_ids              -- CLIP-tokenized image description (used when no real image)
+        use_image_flag             -- 1.0 = real image available, 0.0 = use description fallback
         label                      -- 0=Left, 1=Center, 2=Right
         raw_text                   -- keeping the original text for explainability later
+
+    The use_image_flag is the key addition. When get_data.py couldn't get a
+    real image (HF CDN 404'd and og:image scraping also failed), it saves
+    the image_description to a .desc.txt sidecar file next to the image.
+    We check for that sidecar here and route to CLIP's text encoder instead
+    of the vision encoder, so CLIP gets real signal either way.
     """
 
     def __init__(self, dataframe, tokenizer, image_transform,
@@ -177,8 +181,9 @@ class BiasDataset(Dataset):
         self.text_col = text_col
         self.image_col = image_col
         self.label_col = label_col
+        self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-        # Tokenize everything upfront -- much faster than doing it one sample at a time during training
+        # Tokenize all article text upfront -- much faster than per-sample during training
         texts = [clean_text(str(t)) for t in self.data[text_col]]
         self.encodings = tokenize_text(texts, tokenizer)
 
@@ -186,13 +191,39 @@ class BiasDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
+        image_path = Path(str(self.data[self.image_col][idx]))
+        desc_path = image_path.with_suffix(".desc.txt")
+
+        if desc_path.exists():
+            # No real image available -- use image_description with CLIP text encoder.
+            # get_data.py writes this sidecar when og:image scraping fails but
+            # image_description exists. CLIP's text encoder still gives meaningful
+            # visual semantics from the description (e.g. "protesters march outside
+            # capitol building" encodes differently than "stock chart trending up").
+            description = desc_path.read_text(encoding="utf-8").strip()
+            clip_inputs = self.clip_processor(
+                text=description,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=77,
+                truncation=True,
+            )
+            pixel_values = torch.zeros(3, IMAGE_SIZE, IMAGE_SIZE)
+            clip_text_ids = clip_inputs["input_ids"].squeeze(0)
+            use_image_flag = torch.tensor(0, dtype=torch.float)
+        else:
+            # Real image -- load and transform normally for CLIP vision encoder
+            pixel_values = load_image(str(image_path), self.image_transform)
+            clip_text_ids = torch.zeros(77, dtype=torch.long)
+            use_image_flag = torch.tensor(1, dtype=torch.float)
+
         return {
             "input_ids": self.encodings["input_ids"][idx],
             "attention_mask": self.encodings["attention_mask"][idx],
-            "image": load_image(
-                self.data[self.image_col][idx],
-                self.image_transform
-            ),
+            "image": pixel_values,          # existing train.py expects this key
+            "pixel_values": pixel_values,   # fusion model uses this key
+            "clip_text_ids": clip_text_ids,
+            "use_image_flag": use_image_flag,
             "label": torch.tensor(
                 LABEL_MAP[self.data[self.label_col][idx]],
                 dtype=torch.long
